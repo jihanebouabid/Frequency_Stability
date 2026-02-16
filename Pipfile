@@ -8,3 +8,6 @@ pandas = "*"
 
 [requires]
 python_version = "3.14"
+
+[dev-packages]
+ipykernel = "*"
