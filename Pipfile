@@ -5,6 +5,10 @@ name = "pypi"
 
 [packages]
 pandas = "*"
+matplotlib = "*"
+seaborn = "*"
+numpy = "*"
+scipy = "*"
 
 [requires]
 python_version = "3.14"
