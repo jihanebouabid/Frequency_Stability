@@ -9,6 +9,8 @@ matplotlib = "*"
 seaborn = "*"
 numpy = "*"
 scipy = "*"
+sklearn = "*"
+scikit-learn = "*"
 
 [requires]
 python_version = "3.14"

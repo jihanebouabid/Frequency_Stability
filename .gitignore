@@ -220,3 +220,12 @@ __marimo__/
 
 # Data folder
 frequency_voltage_data/
+finland_2019_01.csv
+finland_2019_02.csv
+finland_2019_11.csv
+finland_2019_12.csv
+
+# Old frequency eda
+EDA_finland.ipynb
+EDA_finland_copy_2.ipynb
+EDA_finland_copy.ipynb
