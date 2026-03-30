@@ -220,14 +220,47 @@ __marimo__/
 
 # Data folder
 frequency_voltage_data/
-finland_2019_01.csv
-finland_2019_02.csv
-finland_2019_11.csv
-finland_2019_12.csv
+finland_2016_01.csv
+finland_2016_02.csv
+finland_2016_03.csv
 finland_2016_04.csv
+finland_2016_05.csv
+finland_2016_06.csv
+finland_2016_07.csv
+finland_2016_08.csv
+finland_2016_10.csv
+
+
+
+
+#results:
+hd_results_2016.csv
+model_targets_v4.csv
+model_targets.csv
+final_results_2016.csv
 
 # Old frequency eda
 EDA_finland.ipynb
 EDA_finland_copy_2.ipynb
 EDA_finland_copy.ipynb
 eda_last.ipynb
+H_D_ESTIMATE copy.ipynb
+
+
+
+# other files
+cnn_virtual_inertia.pt
+cnn_virtual_inertia_v4.pt
+event_segments
+trajectories
+
+
+.claude
+
+# Last files related to ai models
+run_output
+make_presentation.py
+nordic_grid_vi_results.pptx
+analysis_results_concerns.md
+ai_model_proposal.md
+~$nordic_grid_vi_results.pptx
