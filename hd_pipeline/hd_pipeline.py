@@ -574,7 +574,7 @@ def plot_summary_results(results_df, plot_dir):
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 7 — Automated pipeline
 # ══════════════════════════════════════════════════════════════════════════════
-def run_pipeline(data_dir='.', output_csv='hd_results_2016.csv',
+def run_pipeline(data_dir='initial_data', output_csv='hd_pipeline/hd_results_2016.csv',
                  force_rerun=False, plot_dir=None):
     if force_rerun and os.path.exists(output_csv):
         os.remove(output_csv)
@@ -694,8 +694,8 @@ def run_pipeline(data_dir='.', output_csv='hd_results_2016.csv',
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Nordic Grid H and D Estimation Pipeline")
-    parser.add_argument('--data-dir', type=str, default='.', help='Directory containing the monthly CSV files')
-    parser.add_argument('--output', type=str, default='hd_results_2016.csv', help='Output CSV filename')
+    parser.add_argument('--data-dir', type=str, default='initial_data', help='Directory containing the monthly CSV files')
+    parser.add_argument('--output', type=str, default='hd_pipeline/hd_results_2016.csv', help='Output CSV filename')
     parser.add_argument('--force', action='store_true', help='Force rerun (deletes existing output CSV)')
     parser.add_argument('--plots', type=str, default='plots', help='Directory to save generated plots')
     

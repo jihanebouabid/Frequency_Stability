@@ -258,9 +258,21 @@ trajectories
 .claude
 
 # Last files related to ai models
+
+ai_models/ai_models_gb.py
+ai_models_gru.py
+ai_models_ridge.py
+ai_models_rf.py
+
+
+
+
 run_output
 make_presentation.py
 nordic_grid_vi_results.pptx
 analysis_results_concerns.md
 ai_model_proposal.md
-~$nordic_grid_vi_results.pptx
+event_segments_full
+latex_files
+extract_full_segments.py
+md_files
