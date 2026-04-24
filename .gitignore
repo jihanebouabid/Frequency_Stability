@@ -258,6 +258,8 @@ trajectories
 .claude
 
 # Last files related to ai models
+ai_models/ai_models_PINN_latest.py
+
 
 ai_models/ai_models_gb.py
 ai_models_gru.py
@@ -276,3 +278,6 @@ event_segments_full
 latex_files
 extract_full_segments.py
 md_files
+
+
+results/v12_150s_vi_metrics.csv
