@@ -36,8 +36,8 @@ RES_DIR.mkdir(exist_ok=True)
 DT        = 0.1   # PMU sampling interval [s]
 HV_MAX    = 2.0   # maximum virtual inertia injection [s]
 DV_MAX    = 1.0   # maximum virtual damping injection [pu]
-LAM_H       = 0.1   # inertia injection cost weight
-LAM_D       = 0.5   # damping injection cost weight (higher than LAM_H — penalises D_v saturation)
+LAM_H       = 0.15  # inertia injection cost weight
+LAM_D       = 1.0   # damping injection cost weight (higher than LAM_H — penalises D_v saturation)
 SG_WINDOW = 51    # Savitzky-Golay window for RoCoF (5.1 s — matches hd_pipeline.py)
 SG_ORDER  = 3     # Savitzky-Golay polynomial order
 
@@ -56,7 +56,7 @@ PRE_IDX   = 50    # onset index in df_full (5 s pre-onset at 10 Hz)
 ####################### ROCOF FILTER #######################
 
 def _rocof(df: np.ndarray) -> np.ndarray:
-    """Savitzky-Golay RoCoF — matches hd_pipeline.py exactly."""
+    """Savitzky-Golay RoCoF — matches hd_pipeline.py."""
     return savgol_filter(df, window_length=SG_WINDOW, polyorder=SG_ORDER,
                          deriv=1, delta=DT)
 
@@ -85,7 +85,7 @@ def load_data() -> list[dict]:
             "onset_str": key,
             "direction": 1.0 if row["direction"] == "over" else -1.0,
             "cause":     row["cause"],
-            "H_real":    float(row["H_pw_mean"]),
+            "H_real":    float(row["H_ref"]),
             "D_real":    float(row["D_pw_mean"]),
             "df_train":  seg["df_train"].astype(np.float32),
             "df_full":   seg["df_full"].astype(np.float32)  if hfull else None,
@@ -108,7 +108,7 @@ def build_arrays(events : list[dict] ) -> tuple[np.ndarray, np.ndarray, np.ndarr
     X_ts_ode : (N, 2, T_WIN)   ODE input — full 150 s window, raw physical units
     X_ctx    : (N, 2)           scalars   — [H_real, D_real]
 
-    RoCoF is computed on-the-fly with Savitzky-Golay from the full df window
+    RoCoF is computed with Savitzky-Golay from the full df window
     so that both arrays use the same smooth derivative — consistent with hd_pipeline.py.
     The first T_PRED values of that rocof go to the CNN; all T_WIN go to the ODE.
     """
@@ -132,7 +132,7 @@ def build_arrays(events : list[dict] ) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
     print(f"CNN input  : {X_ts_cnn.shape}  (N x 2 x T_PRED  = {T_PRED*DT:.0f} s)")
     print(f"ODE input  : {X_ts_ode.shape}  (N x 2 x T_WIN   = {T_WIN*DT:.0f} s)")
-    print(f"Context    : {X_ctx.shape}  (N x [H_real, D_real])")
+    print(f"Context    : {X_ctx.shape}  (N x [H_ref, D_pw_mean])")
     return X_ts_cnn, X_ts_ode, X_ctx
 
 ####################### MODEL ARCHITECTURE #######################
@@ -176,9 +176,9 @@ def vi_filter_torch(
 
 ####################### 2. MODEL ARCHITECTURE #######################
 
-class PhysicsPINN(nn.Module):
+class PI_CNN(nn.Module):
     """
-    Single-branch physics-informed neural network.
+    Single-branch Physics-Informed CNN (PI-CNN).
 
     The CNN encodes the shape of the frequency disturbance from the two
     time-series channels (Delta_f and RoCoF).  H_real and D_real are
@@ -186,24 +186,58 @@ class PhysicsPINN(nn.Module):
     that the waveform alone cannot determine.
     """
 
-    def __init__(self): # defining the layers  
-        super().__init__() # calling the parent class constructor
-        self.conv = nn.Conv1d(2, 16, kernel_size=15, padding=7) 
-        self.gap = nn.AdaptiveAvgPool1d(1) # collapse the entire time axis down to exactly 1 value per channel 
-        self.head = nn.Sequential( # is the MLP that makes the final prediction.
-            nn.Linear(16 + 2, 8),   # 16 CNN embedding + H_real + D_real
-            nn.ReLU(), # applying the ReLU activation function
-            nn.Linear(8, 2), # mapping the output to the range [0, 1]
-            nn.Sigmoid(), # applying the Sigmoid activation function
+    # def __init__(self): # defining the layers  
+    #     super().__init__() # calling the parent class constructor
+    #     self.conv = nn.Conv1d(2, 16, kernel_size=15, padding=7) 
+    #     self.gap = nn.AdaptiveAvgPool1d(1) # collapse the entire time axis down to exactly 1 value per channel 
+    #     self.head = nn.Sequential( 
+    #         nn.Linear(16 + 2, 8),   # 16 CNN embedding + H_real + D_real
+    #         nn.ReLU(), # applying the ReLU activation function
+    #         nn.Linear(8, 2), # mapping the output to the range [0, 1]
+    #         nn.Sigmoid(), # applying the Sigmoid activation function
+    #     )
+    
+    # def forward( 
+    #     self, 
+    #     x_ts: torch.Tensor,   # (B, 2, T)  z-scored [Delta_f, RoCoF]
+    #     x_ctx: torch.Tensor,   # (B, 2)     z-scored [H_real, D_real]
+    # ) -> tuple[torch.Tensor, torch.Tensor]:
+    #     emb = self.gap(torch.relu(self.conv(x_ts))).squeeze(-1)  # (B, 16)
+    #     out = self.head(torch.cat([emb, x_ctx], dim=1))          # (B, 2)
+    #     return out[:, 0] * HV_MAX, out[:, 1] * DV_MAX
+
+    
+    def __init__(self):
+        super().__init__()
+
+        # CNN feature extractor (time-series encoder)
+        self.conv = nn.Conv1d(2, 16, kernel_size=15, padding=7)
+
+        # temporal aggregation
+        self.gap = nn.AdaptiveAvgPool1d(1) # collapsing the temporal dimension , computes the mean of each of the 16 feature maps
+
+        # MLP applied AFTER CNN + context fusion
+        self.mlp = nn.Sequential(
+            nn.Linear(16 + 2, 8),   # CNN embedding + context
+            nn.ReLU(),
+            nn.Linear(8, 2),
+            nn.Sigmoid(),
         )
-    def forward( 
-        self, 
-        x_ts: torch.Tensor,   # (B, 2, T)  z-scored [Delta_f, RoCoF]
-        x_ctx: torch.Tensor,   # (B, 2)     z-scored [H_real, D_real]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        emb = self.gap(torch.relu(self.conv(x_ts))).squeeze(-1)  # (B, 16)
-        out = self.head(torch.cat([emb, x_ctx], dim=1))          # (B, 2)
+
+    def forward(self, x_ts, x_ctx):
+
+        # 1. CNN feature extraction
+        cnn_feat = self.conv(x_ts)              # (B, 16, T)
+        cnn_feat = torch.relu(cnn_feat)
+        # 2. Temporal pooling (collapse time dimension)
+        emb = self.gap(cnn_feat).squeeze(-1)    # (B, 16)
+        # 3. Feature fusion (CNN + context)
+        fused = torch.cat([emb, x_ctx], dim=1)  # (B, 18)
+        # 4. MLP prediction 
+        out = self.mlp(fused)            # (B, 2)
+        # 5. Scale to physical range
         return out[:, 0] * HV_MAX, out[:, 1] * DV_MAX
+
     
 ####################### 3. PHYSICS LOSS #######################
 
@@ -220,7 +254,7 @@ def physics_loss(
 
     """
     ise = (df_stab**2).sum(dim=1).mean() *DT
-    cost= (LAM_H * H_v / HV_MAX + LAM_D * D_v / DV_MAX).mean()
+    cost= (LAM_H * H_v / HV_MAX + LAM_D * D_v / DV_MAX).mean() # regularization term; minimum injection that still stabilizes well.
     return ise + cost 
 
 ####################### 4. TRAINING (LOOCV) #########################
@@ -233,7 +267,7 @@ def run_loocv(
 ) -> dict:
 
     """
-        Leave-One-Out Cross-Validation.
+        Leave-One-Out Cross-Validation. 
 
         CNN sees only the first T_PRED samples (2s) (T_PRED*DT seconds) of each event.
         ODE runs on the full T_WIN samples (150 s) for the physics loss.
@@ -280,7 +314,7 @@ def run_loocv(
         H_real_t    = torch.tensor(X_ctx[tr, 0],        dtype=torch.float32)
         D_real_t    = torch.tensor(X_ctx[tr, 1],        dtype=torch.float32)
 
-        model = PhysicsPINN()
+        model = PI_CNN()
         opt   = torch.optim.Adam(model.parameters(), lr=LR)
 
         fold_losses = []
@@ -438,7 +472,7 @@ def plot_loss_curves(res: dict) -> None:
             label="Mean across folds")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Physics loss")
-    ax.set_title("PhysicsPINN — training loss per LOO fold")
+    ax.set_title("PI-CNN — training loss per LOO fold")
     ax.legend()
     ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
@@ -516,8 +550,8 @@ def plot_vi_stabilisation(events: list[dict], res: dict) -> None:
         plt.Line2D([0], [0], color="#2980b9", lw=1.5, ls="--", label="Stabilised Delta_f"),
     ], loc="lower right", fontsize=9, ncol=2)
     fig.suptitle(
-        "PhysicsPINN — Frequency Stabilisation (LOO-CV)\n"
-        "Inputs: Delta_f(t), RoCoF(t), H_real, D_real  |  "
+        "PI-CNN — Frequency Stabilisation (LOO-CV)\n"
+        "Inputs: Delta_f(t), RoCoF(t), H_ref, D_pw_mean  |  "
         "Loss: differentiable swing-equation ODE",
         fontsize=10, fontweight="bold",
     )
@@ -558,7 +592,7 @@ def plot_diagnostics(df: pd.DataFrame) -> None:
 
 def main() -> None:
     print("=" * 65)
-    print("  ai_models_v12.py — PhysicsPINN")
+    print("  ai_models_PINN_latest_2.py — PI-CNN")
     print("=" * 65 + "\n")
 
     events                    = load_data()

@@ -21,6 +21,7 @@ python hd_pipeline.py --plots plots_dir    # override plots directory
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 1 — Imports and constants
 # ══════════════════════════════════════════════════════════════════════════════
+import gc
 import os
 import glob
 import argparse
@@ -28,11 +29,9 @@ import sys
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
-from scipy.stats import linregress 
 import matplotlib
 matplotlib.use('Agg') # non-interactive backend — saves figures to files
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
 # ── Sampling ──────────────────────────────────────────────────────────────────
 DT = 0.1 # sampling interval [s] — Kangasala PMU @ 10 Hz
@@ -44,9 +43,6 @@ WINDOW_S = 5.0 # SG window length [s]; actual window = 5.1 s (51 samples)
 _HALF = round(WINDOW_S * FS / 2) # 25 half-samples
 WLEN = 2 * _HALF + 1 # 51 samples = 5.1 s (main SG)
 SG_HALF_S = (WLEN // 2) * DT # 2.5 s half-window
-_HALF_SH = round(0.55 * FS) # 5 half-samples
-WLEN_SH = 2 * _HALF_SH + 1 # 11 samples = 1.1 s (short SG for RoCoF)
-POLY_SH = 5 # polynomial order for short SG
 
 # ── Gap handling ──────────────────────────────────────────────────────────────
 EXCL_BUFFER = 120 # [s] exclusion zone on each side of moderate/major gaps
@@ -72,17 +68,18 @@ F0 = 50.0 # [Hz] nominal grid frequency
 PRE_ONSET_S = 30.0 # [s] pre-onset window for Δf_pre baseline
 D_PW_SKIP_S = 2.5 # [s] skip SG half-window artefact (= SG_HALF_S)
 D_PW_MIN_DF_HZ = 0.05 # [Hz] minimum |Δf| for a D_pointwise sample
-H_PW_END_S = 3.0 # [s] H_pointwise window length after onset
-H_PW_MIN_ROCOF = 0.030 # [Hz/s] minimum |RoCoF| for an H_pointwise sample
 
 # ── Matching ──────────────────────────────────────────────────────────────────
 MATCH_TOL_S = 120 # [s] tolerance for report-event ↔ detected-segment matching
 
 # ── Validation expected ranges ────────────────────────────────────────────────
-VALID_H_EK_RANGE = (2.0, 6.0) # [s] Nordic H_from_Ek
-VALID_D_NAD_RANGE = (1.0, 4.0) # [pu] D_nadir
-VALID_D_PW_RANGE = (0.5, 3.5) # [pu] D_pw_mean
-VALID_H_PW_RANGE = (1.5, 8.0) # [s] H_pw_mean
+VALID_H_REF_RANGE = (2.0, 6.0) # [s] Nordic H_ref (from Ek)
+VALID_D_PW_RANGE  = (0.5, 3.5) # [pu] D_pw_mean
+
+# ── Excluded events ───────────────────────────────────────────────────────────
+# 2016-01-12: D_pw_mean=6.12 pu — outlier due to point-wise method limitation
+#             on large Nuclear disturbances; excluded from CSV output.
+EXCLUDED_EVENT_DATES = {"2016-01-12"}
 
 # ── Report events (ENTSO-E / Fingrid 2016 FCR disturbance reports) ────────────
 _REPORT_EVENTS_RAW = [
@@ -125,12 +122,16 @@ REPORT_EVENTS = _build_report_events()
 def load_month(filepath):
     df_raw = pd.read_csv(filepath, header=0)
     cols = list(df_raw.columns)
-    df = pd.DataFrame()
-    df.index = pd.to_datetime(df_raw[cols[0]])
-    df.index.name = 'timestamp'
-    raw_vals = df_raw[cols[1]].values.astype(float)
-    
     col_name = cols[1].lower()
+    ts_raw = df_raw[cols[0]].values       # extract timestamps as numpy (strings)
+    raw_vals = df_raw[cols[1]].values.astype(float)  # extract freq values
+    del df_raw                             # free ~700 MB of string data immediately
+
+    df = pd.DataFrame()
+    df.index = pd.to_datetime(ts_raw)
+    df.index.name = 'timestamp'
+    del ts_raw                             # free string array after index is built
+
     if 'mhz' in col_name or (np.nanmax(np.abs(raw_vals)) > 10):
         df['delta_f_Hz'] = raw_vals / 1000.0
     else:
@@ -170,8 +171,8 @@ def load_month(filepath):
     )
 
     df['reliable'] = True
+    buf = pd.Timedelta(seconds=EXCL_BUFFER)
     for _, row in nan_runs_info[nan_runs_info['severity'].isin(['moderate', 'major'])].iterrows():
-        buf = pd.Timedelta(seconds=EXCL_BUFFER)
         df.loc[row['gap_start'] - buf : row['gap_end'] + buf, 'reliable'] = False
         
     return df, nan_runs_info
@@ -180,20 +181,18 @@ def load_month(filepath):
 # Section 3 — SG filtering
 # ══════════════════════════════════════════════════════════════════════════════
 def apply_sg_filters(df, nan_runs_info):
-    arr = (df['delta_f_Hz']
-           .interpolate(method='linear', limit_area='inside')
-           .ffill()
-           .bfill()
-           .values.astype(float))
+    arr = df['delta_f_Hz'].to_numpy(dtype=float)
+    nan_mask = np.isnan(arr)
+    if nan_mask.any():
+        valid = np.where(~nan_mask)[0]
+        arr[nan_mask] = np.interp(np.where(nan_mask)[0], valid, arr[valid])
 
     df['delta_f_smooth'] = savgol_filter(arr, window_length=WLEN, polyorder=POLYORDER, deriv=0, delta=DT)
     df['rocof_Hz_per_s'] = savgol_filter(arr, window_length=WLEN, polyorder=POLYORDER, deriv=1, delta=DT)
-    df['rocof_short_Hz_per_s'] = savgol_filter(arr, window_length=WLEN_SH, polyorder=POLY_SH, deriv=1, delta=DT)
-
     major_gaps = nan_runs_info[nan_runs_info['severity'] == 'major']
     for _, row in major_gaps.iterrows():
         df.loc[row['gap_start']:row['gap_end'],
-               ['delta_f_smooth', 'rocof_Hz_per_s', 'rocof_short_Hz_per_s']] = np.nan
+               ['delta_f_smooth', 'rocof_Hz_per_s']] = np.nan
                
     return df
 
@@ -202,8 +201,7 @@ def apply_sg_filters(df, nan_runs_info):
 # ══════════════════════════════════════════════════════════════════════════════
 def detect_events(df_rel, freq_thresh, rocof_onset_thresh,
                   min_gap_s, min_duration_s, pre_search_s,
-                  post_window_s, rocof_lag_max_s, max_recovery_s,
-                  rocof_short_std=None):
+                  post_window_s, rocof_lag_max_s, max_recovery_s):
     outside = df_rel['delta_f_Hz'].abs() > freq_thresh
     state_change = outside & ~outside.shift(fill_value=False)
     raw_crossings = df_rel[state_change].index.tolist()
@@ -215,16 +213,22 @@ def detect_events(df_rel, freq_thresh, rocof_onset_thresh,
     for t in raw_crossings[1:]:
         if (t - merged[-1]).total_seconds() > min_gap_s:
             merged.append(t)
-            
+
+    _pre_delta      = pd.Timedelta(seconds=pre_search_s)
+    _post_delta     = pd.Timedelta(seconds=post_window_s)
+    _dur_delta      = pd.Timedelta(seconds=min_duration_s)
+    _post_win_rows  = int(post_window_s / DT)
+    _fast_win_rows  = int(max_recovery_s / DT)
+
     seg_records = []
     for t in merged:
-        pre_start = t - pd.Timedelta(seconds=pre_search_s)
-        post_end = t + pd.Timedelta(seconds=post_window_s)
+        pre_start = t - _pre_delta
+        post_end  = t + _post_delta
         window = df_rel.loc[pre_start:post_end]
         if len(window) < 10:
             continue
 
-        crossing_window = df_rel.loc[t : t + pd.Timedelta(seconds=min_duration_s)]
+        crossing_window = df_rel.loc[t : t + _dur_delta]
         if not (crossing_window['delta_f_Hz'].abs() > freq_thresh).all():
             continue
 
@@ -239,14 +243,14 @@ def detect_events(df_rel, freq_thresh, rocof_onset_thresh,
         peak_df = float(post_onset.loc[peak_idx, 'delta_f_Hz'])
         direction = 'under' if peak_df < 0 else 'over'
 
-        peak_rocof = float(window['rocof_short_Hz_per_s'].abs().max())
-        peak_rocof_time = window['rocof_short_Hz_per_s'].abs().idxmax()
+        peak_rocof = float(window['rocof_Hz_per_s'].abs().max())
+        peak_rocof_time = window['rocof_Hz_per_s'].abs().idxmax()
         rocof_lag = (peak_rocof_time - onset_time).total_seconds()
         peak_abs = abs(peak_df)
         
         post_peak = post_onset.loc[peak_idx:]
-        recovery_window = post_peak.iloc[:int(post_window_s / DT)]
-        fast_window = post_peak.iloc[:int(max_recovery_s / DT)]
+        recovery_window = post_peak.iloc[:_post_win_rows]
+        fast_window     = post_peak.iloc[:_fast_win_rows]
         
         recovery_50_fast = fast_window[fast_window['delta_f_Hz'].abs() < peak_abs * 0.5]
         recovery_80_fast = fast_window[fast_window['delta_f_Hz'].abs() < peak_abs * 0.8]
@@ -281,21 +285,6 @@ def detect_events(df_rel, freq_thresh, rocof_onset_thresh,
         })
         
     segs = pd.DataFrame(seg_records).reset_index(drop=True)
-    if len(segs) == 0:
-        return segs, len(raw_crossings)
-
-    if rocof_short_std is not None:
-        strong_thresh = 8 * rocof_short_std
-        moderate_thresh = 4 * rocof_short_std
-        def classify(row):
-            lag_ok = row['rocof_lag_s'] < rocof_lag_max_s
-            if row['max_rocof_Hz_s'] > strong_thresh and lag_ok: return 'STRONG'
-            if row['max_rocof_Hz_s'] > moderate_thresh and lag_ok: return 'MODERATE'
-            return 'WEAK'
-        segs['classification'] = segs.apply(classify, axis=1)
-    else:
-        segs['classification'] = 'UNKNOWN'
-        
     return segs, len(raw_crossings)
 
 def _match_report_to_segment(rrow, segs, tol=MATCH_TOL_S):
@@ -317,6 +306,75 @@ def _match_report_to_segment(rrow, segs, tol=MATCH_TOL_S):
     best = cands.nsmallest(1, 'dt')
     return best.index[0], best.iloc[0]
 
+def _direct_segment_from_report(df_reliable, rrow, rocof_std,
+                                 post_window_s=POST_WINDOW_S,
+                                 max_recovery_s=MAX_RECOVERY_S):
+    """
+    Fallback segment builder used when threshold detection misses a known event.
+    Happens when the PMU records a local frequency deviation ≤ FREQ_THRESH even
+    though the system-wide nadir (from the ENTSO-E report) was larger — typically
+    because the measurement node is electrically distant from the tripped unit.
+    Constructs the segment directly from the report timestamp.
+    """
+    r_time    = rrow['report_time']
+    direction = rrow['direction']
+    est_onset = r_time - pd.Timedelta(seconds=float(rrow['delta_t_s']))
+
+    win_start = est_onset - pd.Timedelta(seconds=PRE_SEARCH_S)
+    win_end   = est_onset + pd.Timedelta(seconds=post_window_s)
+    window    = df_reliable.loc[win_start:win_end]
+    if len(window) < 10:
+        return None
+
+    # RoCoF-based onset refinement (lower σ since we trust the report time)
+    pre_win     = window.loc[win_start:est_onset]
+    rocof_above = pre_win['rocof_Hz_per_s'].abs() > (SIGMA_CHOICE - 1) * rocof_std
+    onset_time  = pre_win[rocof_above].index[0] if rocof_above.any() else est_onset
+
+    post_onset = window.loc[onset_time:]
+    if len(post_onset) == 0:
+        return None
+
+    peak_idx = (post_onset['delta_f_Hz'].idxmin() if direction == 'under'
+                else post_onset['delta_f_Hz'].idxmax())
+    peak_df  = float(post_onset.loc[peak_idx, 'delta_f_Hz'])
+    peak_abs = abs(peak_df)
+
+    peak_rocof      = float(window['rocof_Hz_per_s'].abs().max())
+    peak_rocof_time = window['rocof_Hz_per_s'].abs().idxmax()
+    rocof_lag       = (peak_rocof_time - onset_time).total_seconds()
+
+    post_peak       = post_onset.loc[peak_idx:]
+    recovery_window = post_peak.iloc[:int(post_window_s  / DT)]
+    fast_window     = post_peak.iloc[:int(max_recovery_s / DT)]
+
+    r50f = fast_window[fast_window['delta_f_Hz'].abs() < peak_abs * 0.5]
+    r80f = fast_window[fast_window['delta_f_Hz'].abs() < peak_abs * 0.8]
+    r50s = recovery_window[recovery_window['delta_f_Hz'].abs() < peak_abs * 0.5]
+
+    if len(r50f) > 0:
+        end_time, recovery_type = r50f.index[0], '50%_fast'
+    elif len(r80f) > 0:
+        end_time, recovery_type = r80f.index[0], '80%_fast'
+    elif len(r50s) > 0:
+        end_time, recovery_type = r50s.index[0], '50%_slow'
+    else:
+        end_time = recovery_window.index[-1] if len(recovery_window) > 0 else onset_time
+        recovery_type = 'none'
+
+    return pd.Series({
+        'onset_time'      : onset_time,
+        'peak_time'       : peak_idx,
+        'peak_rocof_time' : peak_rocof_time,
+        'end_time'        : end_time,
+        'direction'       : direction,
+        'peak_df_Hz'      : round(peak_df, 4),
+        'max_rocof_Hz_s'  : round(peak_rocof, 5),
+        'rocof_lag_s'     : round(rocof_lag, 1),
+        'duration_s'      : round((end_time - onset_time).total_seconds(), 1),
+        'recovery_type'   : recovery_type,
+    })
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 5 — H and D estimation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -329,22 +387,11 @@ def estimate_hd(df_reliable, seg, report_row):
     dP_MW = float(report_row['delta_P_MW'])
     dP_pu = sign * dP_MW / S_BASE_MW
     
-    H_from_Ek = float(report_row['Ek_GWs']) * 1000.0 / S_BASE_MW
-    H_est = H_from_Ek
+    H_ref = float(report_row['Ek_GWs']) * 1000.0 / S_BASE_MW
+    H_est = H_ref
     
-    try:
-        df_nadir_Hz = float(df_reliable.loc[nadir_t, 'delta_f_Hz'])
-    except KeyError:
-        idx = df_reliable.index.get_indexer([nadir_t], method='nearest')[0]
-        df_nadir_Hz = float(df_reliable.iloc[idx]['delta_f_Hz'])
-        
-    if abs(df_nadir_Hz) < 1e-6:
-        D_nadir = np.nan
-    else:
-        D_nadir = abs((dP_pu * F0) / df_nadir_Hz)
-
     pw_start = onset + pd.Timedelta(seconds=D_PW_SKIP_S)
-    d_pw_win = df_reliable.loc[pw_start:nadir_t].copy()
+    d_pw_win = df_reliable.loc[pw_start:nadir_t]
     D_pw_mean = D_pw_median = D_pw_std = np.nan
     D_pw_n = 0
     
@@ -361,30 +408,6 @@ def estimate_hd(df_reliable, seg, report_row):
             D_pw_std = float(np.nanstd(D_samples))
             D_pw_n = int(len(D_samples))
 
-    h_pw_win = df_reliable.loc[onset : onset + pd.Timedelta(seconds=H_PW_END_S)].copy()
-    H_pw_mean = H_pw_median = H_pw_std = np.nan
-    H_pw_n = 0
-    
-    if len(h_pw_win) >= 5:
-        df_h_arr = h_pw_win['delta_f_Hz'].values
-        rocof_h_arr = h_pw_win['rocof_Hz_per_s'].values
-        expected_rocof_sign = 1.0 if direction == 'over' else -1.0
-        valid_h = (
-            (np.abs(rocof_h_arr) > H_PW_MIN_ROCOF) &
-            (np.sign(rocof_h_arr) == expected_rocof_sign)
-        )
-        if valid_h.any():
-            numer_h = dP_pu * F0 - D_nadir * df_h_arr[valid_h]
-            denom_h = 2.0 * rocof_h_arr[valid_h]
-            with np.errstate(divide='ignore', invalid='ignore'):
-                H_raw = np.where(np.abs(denom_h) > 1e-8, numer_h / denom_h, np.nan)
-            H_samples = H_raw[(H_raw > 1.0) & (H_raw < 8.0)]
-            if len(H_samples) >= 3:
-                H_pw_mean = float(np.nanmean(H_samples))
-                H_pw_median = float(np.nanmedian(H_samples))
-                H_pw_std = float(np.nanstd(H_samples))
-                H_pw_n = int(len(H_samples))
-
     def _r(v, d=4):
         return round(float(v), d) if (v is not None and not np.isnan(v)) else np.nan
 
@@ -394,17 +417,11 @@ def estimate_hd(df_reliable, seg, report_row):
         'direction'   : direction,
         'dP_MW'       : dP_MW,
         'dP_pu'       : _r(dP_pu, 6),
-        'df_nadir_Hz' : _r(df_nadir_Hz),
-        'H_from_Ek'   : _r(H_from_Ek),
-        'D_nadir'     : _r(D_nadir),
+        'H_ref'       : _r(H_ref),
         'D_pw_mean'   : _r(D_pw_mean),
         'D_pw_median' : _r(D_pw_median),
         'D_pw_std'    : _r(D_pw_std),
         'D_pw_n'      : D_pw_n,
-        'H_pw_mean'   : _r(H_pw_mean),
-        'H_pw_median' : _r(H_pw_median),
-        'H_pw_std'    : _r(H_pw_std),
-        'H_pw_n'      : H_pw_n,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -414,18 +431,18 @@ def plot_event_dynamics(df_reliable, seg, result_dict, plot_dir='plots'):
     """
     Generates a two-panel time-series plot (Frequency and RoCoF) for a single event.
     """
-    if plot_dir and not os.path.exists(plot_dir):
-        os.makedirs(plot_dir)
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
 
     onset = seg['onset_time']
     nadir = seg['peak_time']
     recovery = seg['end_time']
     peak_rocof_t = seg['peak_rocof_time']
-    
+
     plot_start = onset - pd.Timedelta(seconds=30)
-    plot_end = recovery + pd.Timedelta(seconds=30)
-    
-    win = df_reliable.loc[plot_start:plot_end].copy()
+    plot_end   = recovery + pd.Timedelta(seconds=30)
+
+    win = df_reliable.loc[plot_start:plot_end]
     if win.empty:
         return
     
@@ -450,23 +467,22 @@ def plot_event_dynamics(df_reliable, seg, result_dict, plot_dir='plots'):
     ax1.legend(loc='lower right')
 
     # Bottom Panel
-    ax2.plot(t_rel, win['rocof_short_Hz_per_s'], color='lightblue', label='Short SG RoCoF', lw=1.5)
-    ax2.plot(t_rel, win['rocof_Hz_per_s'], color='darkred', label='Main SG RoCoF', lw=2)
-    
+    ax2.plot(t_rel, win['rocof_Hz_per_s'], color='darkred', label='SG RoCoF', lw=2)
+
     t_peak_rocof_rel = (peak_rocof_t - onset).total_seconds()
-    ax2.scatter(t_peak_rocof_rel, win.loc[peak_rocof_t, 'rocof_short_Hz_per_s'], color='purple', zorder=5, s=80, label='Peak RoCoF')
+    ax2.scatter(t_peak_rocof_rel, win.loc[peak_rocof_t, 'rocof_Hz_per_s'], color='purple', zorder=5, s=80, label='Peak RoCoF')
     
     ax2.axvline(0, color='black', ls='--', lw=1.5, alpha=0.7)
-    ax2.axvspan(0, 3.0, color='gray', alpha=0.15, label='H Pointwise Window (0-3s)')
 
     ax2.set_ylabel('RoCoF (Hz/s)', fontweight='bold')
     ax2.set_xlabel('Time relative to event onset (seconds)', fontweight='bold')
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc='lower right')
     
+    d_pw_str = f"{result_dict['D_pw_mean']:.4f}" if not np.isnan(result_dict['D_pw_mean']) else 'nan'
     info_text = (
-        f"H_from_Ek: {result_dict['H_from_Ek']} s\n"
-        f"D_nadir: {result_dict['D_nadir']} pu\n"
+        f"H_ref: {result_dict['H_ref']} s\n"
+        f"D_pw_mean: {d_pw_str} pu\n"
         f"Direction: {result_dict['direction']}"
     )
     fig.text(0.02, 0.02, info_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'))
@@ -480,8 +496,7 @@ def plot_event_dynamics(df_reliable, seg, result_dict, plot_dir='plots'):
 
 def plot_summary_results(results_df, plot_dir):
     """
-    Two-panel bar chart: H_from_Ek vs H_pw_mean (left) and D_nadir vs D_pw_mean (right).
-    NaN H_pw / D_pw rows are skipped — they do not render as spurious zero bars.
+    Two-panel bar chart: H_ref (left) and D_pw_mean (right).
     Y-axes are fixed to physical Nordic bounds so out-of-range values are immediately visible.
     """
     if len(results_df) < 2:
@@ -504,50 +519,34 @@ def plot_summary_results(results_df, plot_dir):
     # ── H panel ───────────────────────────────────────────────────────────────
     ax = axes[0]
     ax.axhspan(2.0, 6.0, color='steelblue', alpha=0.08, label='Expected range 2–6 s')
-    ax.bar(x_ev - width/2, df['H_from_Ek'], width,
-           color='navy', alpha=0.85, label='H_from_Ek  [PRIMARY]')
+    ax.bar(x_ev, df['H_ref'], width * 1.4,
+           color='navy', alpha=0.85, label='H_ref  [from Ek]')
 
-    mask_h = df['H_pw_mean'].notna()
-    if mask_h.any():
-        h_pw  = df.loc[mask_h, 'H_pw_mean'].values
-        h_std = df.loc[mask_h, 'H_pw_std'].fillna(0).values
-        ax.bar(x_ev[mask_h] + width/2, h_pw, width,
-               color='steelblue', alpha=0.75, label='H_pw_mean  [diagnostic]')
-        ax.errorbar(x_ev[mask_h] + width/2, h_pw, yerr=h_std,
-                    fmt='none', color='black', capsize=4, lw=1.2, alpha=0.7)
-        ax.legend(fontsize=9, loc='upper right')
-    else:
-        ax.legend(fontsize=9, loc='upper right')
-
-    h_mean = df['H_from_Ek'].mean()
+    h_mean = df['H_ref'].mean()
     ax.axhline(h_mean, color='navy', ls='--', lw=1.4,
-               label=f'mean H_Ek = {h_mean:.2f} s')
+               label=f'mean H_ref = {h_mean:.2f} s')
     ax.set_xticks(x_ev)
     ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('H  [s]', fontweight='bold')
-    ax.set_ylim(0, 8.0)   # hard upper = physical Nordic maximum
+    ax.set_ylim(0, 8.0)
     ax.set_title('Inertia constant H per event', fontweight='bold', pad=8)
+    ax.legend(fontsize=9, loc='upper right')
     ax.grid(True, alpha=0.35, axis='y', ls=':')
 
     # ── D panel ───────────────────────────────────────────────────────────────
     ax = axes[1]
-    ax.axhspan(1.0, 4.0, color='red', alpha=0.06, label='Expected range 1–4 pu')
-    ax.bar(x_ev - width/2, df['D_nadir'], width,
-           color='red', alpha=0.80, label='D_nadir  [PRIMARY]')
+    ax.axhspan(0.5, 3.5, color='darkorange', alpha=0.06, label='Expected range 0.5–3.5 pu')
 
     mask_d = df['D_pw_mean'].notna()
     if mask_d.any():
         d_pw  = df.loc[mask_d, 'D_pw_mean'].values
         d_std = df.loc[mask_d, 'D_pw_std'].fillna(0).values
-        ax.bar(x_ev[mask_d] + width/2, d_pw, width,
-               color='darkorange', alpha=0.80, label='D_pw_mean  [cross-check]')
-        ax.errorbar(x_ev[mask_d] + width/2, d_pw, yerr=d_std,
+        ax.bar(x_ev[mask_d], d_pw, width * 1.4,
+               color='darkorange', alpha=0.85, label='D_pw_mean')
+        ax.errorbar(x_ev[mask_d], d_pw, yerr=d_std,
                     fmt='none', color='black', capsize=4, lw=1.2, alpha=0.7)
 
-    d_mean    = df['D_nadir'].mean()
     d_pw_mean = float(df['D_pw_mean'].mean()) if mask_d.any() else None
-    ax.axhline(d_mean, color='red', ls='--', lw=1.4,
-               label=f'mean D_nadir = {d_mean:.2f} pu')
     if d_pw_mean is not None:
         ax.axhline(d_pw_mean, color='darkorange', ls='--', lw=1.4,
                    label=f'mean D_pw = {d_pw_mean:.2f} pu')
@@ -619,60 +618,55 @@ def run_pipeline(data_dir='initial_data', output_csv='hd_pipeline/hd_results_201
         df, nan_runs = load_month(fpath)
         df = apply_sg_filters(df, nan_runs)
         df_reliable = df[df['reliable']].copy()
-        
+        del df, nan_runs  # free full-month DataFrame (~1.3 GB) — no longer needed
+
         if len(df_reliable) < 100:
             print(f"   [WARNING] {month_label} — insufficient reliable data, skipping.")
+            del df_reliable
             continue
 
         rocof_std = float(df_reliable['rocof_Hz_per_s'].std())
-        rocof_short_std = float(df_reliable['rocof_short_Hz_per_s'].std())
         rocof_onset_thr = SIGMA_CHOICE * rocof_std
 
-        segments, n_raw = detect_events(
+        segments, _ = detect_events(
             df_reliable, freq_thresh=FREQ_THRESH, rocof_onset_thresh=rocof_onset_thr,
             min_gap_s=MIN_EVENT_GAP_S, min_duration_s=MIN_DURATION_S, pre_search_s=PRE_SEARCH_S,
             post_window_s=POST_WINDOW_S, rocof_lag_max_s=ROCOF_LAG_MAX_S,
-            max_recovery_s=MAX_RECOVERY_S, rocof_short_std=rocof_short_std
+            max_recovery_s=MAX_RECOVERY_S
         )
 
-        segments_est = segments[
-            (segments['classification'] != 'WEAK') &
-            (segments['recovery_type'].isin(['50%_fast', '80%_fast']))
-        ].copy().reset_index(drop=True)
-
-        if month_label == '2016-01' and len(segments_est) == 0 and len(segments) > 0:
-            print(f"   [INFO] Retrying January with relaxed recovery window (90s).")
-            segments, n_raw = detect_events(
-                df_reliable, freq_thresh=FREQ_THRESH, rocof_onset_thresh=rocof_onset_thr,
-                min_gap_s=MIN_EVENT_GAP_S, min_duration_s=MIN_DURATION_S, pre_search_s=PRE_SEARCH_S,
-                post_window_s=POST_WINDOW_S, rocof_lag_max_s=ROCOF_LAG_MAX_S,
-                max_recovery_s=JAN_MAX_RECOVERY_S, 
-                rocof_short_std=rocof_short_std
-            )
-            segments_est = segments[
-                (segments['classification'] != 'WEAK') &
-                (segments['recovery_type'].isin(['50%_fast', '80%_fast', '50%_slow']))
-            ].copy().reset_index(drop=True)
-
-        if len(segments_est) == 0:
-            print(f"   [WARNING] No estimation-grade events found.")
+        if len(segments) == 0:
+            print(f"   [WARNING] No segments detected.")
+            del df_reliable
             continue
 
         month_reports = REPORT_EVENTS[REPORT_EVENTS['month'] == month_label]
-        
+
         for _, rrow in month_reports.iterrows():
-            best_idx, best_seg = _match_report_to_segment(rrow, segments_est)
-            
+            _, best_seg = _match_report_to_segment(rrow, segments)
+
+            if best_seg is None:
+                best_seg = _direct_segment_from_report(df_reliable, rrow, rocof_std)
+                if best_seg is not None:
+                    print(f"   [FALLBACK] Threshold miss — using report-time segment for {rrow['date_str']}")
+
             if best_seg is not None:
                 result_dict = estimate_hd(df_reliable, best_seg, rrow)
-                all_results.append(result_dict)
-                
-                print(f"   [MATCH] {rrow['date_str']} | H: {result_dict['H_from_Ek']}s | D: {result_dict['D_nadir']}pu")
-                
+
+                event_date = rrow['report_time'].strftime('%Y-%m-%d')
+                if event_date in EXCLUDED_EVENT_DATES:
+                    print(f"   [EXCLUDED] {rrow['date_str']} — in exclusion list, skipping.")
+                else:
+                    all_results.append(result_dict)
+                    print(f"   [MATCH] {rrow['date_str']} | H_ref: {result_dict['H_ref']}s | D_pw: {result_dict['D_pw_mean']}pu")
+
                 if plot_dir:
                     plot_event_dynamics(df_reliable, best_seg, result_dict, plot_dir)
             else:
                 print(f"   [MISS] No PMU segment matched report event at {rrow['date_str']}")
+
+        del df_reliable  # release before loading next month
+        gc.collect()     # force GC so next month's load starts with clean memory
 
     if all_results:
         new_df = pd.DataFrame(all_results)
